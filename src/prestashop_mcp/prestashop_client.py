@@ -27,10 +27,12 @@ class PrestaShopClient:
         self.base_url = config.shop_url.rstrip('/') + '/api/'
         self.auth = BasicAuth(config.api_key, '')
         self.session: Optional[aiohttp.ClientSession] = None
+        # Fallback until the shop's real languages are detected via _ensure_languages.
         self.available_languages = [
             {"id": 1, "name": "Default"},
             {"id": 2, "name": "Secondary"}
-        ]  # Default language setup - can be enhanced with dynamic detection
+        ]
+        self._languages_loaded = False
     
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
@@ -87,6 +89,39 @@ class PrestaShopClient:
             {"id": lang["id"], "value": value}
             for lang in self.available_languages
         ]
+
+    async def _ensure_languages(self) -> None:
+        """Detect the shop's active languages once and cache them."""
+        if self._languages_loaded:
+            return
+        try:
+            response = await self._make_request(
+                'GET', 'languages',
+                params={'filter[active]': '1', 'display': '[id]'}
+            )
+            languages = response.get('languages') if isinstance(response, dict) else None
+            parsed = []
+            for lang in languages or []:
+                lang_id = lang.get('id')
+                if lang_id is not None:
+                    parsed.append({"id": int(lang_id), "name": ""})
+            if parsed:
+                self.available_languages = parsed
+            self._languages_loaded = True
+        except Exception as e:
+            logging.warning(f"Could not detect shop languages, using defaults: {e}")
+
+    def _redact_secrets(self, text: str) -> str:
+        """Mask sensitive values (passwords, keys) before they reach the logs."""
+        redacted = text
+        for tag in ("passwd", "password", "secure_key"):
+            redacted = re.sub(
+                rf"(<{tag}>).*?(</{tag}>)",
+                r"\1***REDACTED***\2",
+                redacted,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        return redacted
     
     async def _make_request(
         self, 
@@ -112,12 +147,13 @@ class PrestaShopClient:
             # Convert data to XML for write operations
             request_body = self._dict_to_xml(data)
             headers['Content-Type'] = 'application/xml; charset=UTF-8'
-            
-            # Debug logging for XML structure
-            logging.info(f"=== XML Request for {method} {endpoint} ===")
-            logging.info(request_body)
-            logging.info("=== End XML Request ===")
-            
+
+            # Log at DEBUG with secrets masked so passwords/keys never hit the logs.
+            logging.debug(
+                "XML request for %s %s:\n%s",
+                method, endpoint, self._redact_secrets(request_body)
+            )
+
         elif data:
             # For other methods, use JSON (though this should be rare)
             request_body = json.dumps(data)
@@ -333,6 +369,7 @@ class PrestaShopClient:
         weight: Optional[float] = None
     ) -> Dict[str, Any]:
         """Create a new product in PrestaShop with ALL required fields for backend visibility."""
+        await self._ensure_languages()
         link_rewrite = self._generate_link_rewrite(name)
         
         # CRITICAL FIX: Complete product initialization with all required fields
@@ -422,15 +459,31 @@ class PrestaShopClient:
         **kwargs
     ) -> Dict[str, Any]:
         """Update an existing product in PrestaShop."""
+        await self._ensure_languages()
+
         # First get the existing product
         existing = await self._make_request('GET', f'products/{product_id}')
-        
+
         if 'product' not in existing:
             raise PrestaShopAPIError(f"Product {product_id} not found")
-        
-        product_data = existing['product']
-        
-        # Update fields with correct multilingual structure
+
+        current = existing['product']
+
+        # Only resend writable fields. Re-posting read-only/computed fields
+        # (quantity, manufacturer_name, position_in_category, ...) makes the
+        # PUT fail or emit warnings, so we preserve a known writable subset.
+        writable_fields = [
+            "price", "active", "state", "id_category_default",
+            "id_tax_rules_group", "reference", "name", "link_rewrite",
+            "description", "description_short", "available_for_order",
+            "show_price", "visibility", "condition",
+        ]
+        product_data = {"id": str(product_id)}
+        for field in writable_fields:
+            if field in current:
+                product_data[field] = current[field]
+
+        # Apply requested changes with correct multilingual structure
         if 'name' in kwargs:
             product_data['name'] = self._init_multilingual_field(kwargs['name'])
             link_rewrite = self._generate_link_rewrite(kwargs['name'])
@@ -443,10 +496,10 @@ class PrestaShopClient:
             product_data['id_category_default'] = kwargs['category_id']
         if 'active' in kwargs:
             product_data['active'] = "1" if kwargs['active'] else "0"
-        
+
         return await self._make_request(
-            'PUT', 
-            f'products/{product_id}', 
+            'PUT',
+            f'products/{product_id}',
             data={"product": product_data}
         )
     
@@ -525,6 +578,7 @@ class PrestaShopClient:
         link_rewrite: Optional[str] = None
     ) -> Dict[str, Any]:
         """Create a new category in PrestaShop with proper multilingual initialization."""
+        await self._ensure_languages()
         if not link_rewrite:
             link_rewrite = self._generate_link_rewrite(name)
         
@@ -556,6 +610,7 @@ class PrestaShopClient:
         **kwargs
     ) -> Dict[str, Any]:
         """Update an existing category in PrestaShop."""
+        await self._ensure_languages()
         # First get the existing category
         existing = await self._make_request('GET', f'categories/{category_id}')
         
@@ -753,22 +808,20 @@ class PrestaShopClient:
             return {"error": f"Failed to retrieve module: {str(e)}"}
     
     async def install_module(self, module_name: str) -> Dict[str, Any]:
-        """Install a module via PrestaShop API."""
-        # This is typically handled via custom endpoints or hooks
-        # For now, we'll use a configuration-based approach
-        try:
-            module_data = {
-                "module": {
-                    "name": module_name,
-                    "active": "1",
-                    "version": "1.0.0"
-                }
-            }
-            
-            return await self._make_request('POST', 'modules', data=module_data)
-            
-        except Exception as e:
-            return {"error": f"Failed to install module: {str(e)}"}
+        """Module installation is not supported through the webservice API.
+
+        POSTing to /modules does not install a module in PrestaShop, so we
+        report the limitation instead of faking a success.
+        """
+        return {
+            "error": (
+                "Module installation is not supported through the PrestaShop "
+                "webservice API. Install the module from the admin "
+                "(Modules > Module Manager) or via the PrestaShop CLI."
+            ),
+            "supported": False,
+            "module": module_name,
+        }
     
     async def update_module_status(
         self, 
@@ -1207,10 +1260,16 @@ class PrestaShopClient:
                         results.append({config_name: f"error: {str(e)}"})
                 
                 return {
-                    "cache_clear": "completed",
+                    "cache_clear": "attempted",
                     "type": cache_type,
                     "results": results,
-                    "message": "Cache refresh triggered via configuration toggle"
+                    "note": (
+                        "PrestaShop's webservice has no real cache-clear "
+                        "endpoint. This only toggles cache config flags as a "
+                        "best-effort trigger and may not actually flush the "
+                        "Smarty/filesystem cache. For a guaranteed clear, delete "
+                        "var/cache on the server or use the admin."
+                    ),
                 }
             
             else:
@@ -1347,46 +1406,35 @@ class PrestaShopClient:
         
         return await self._make_request('GET', 'configurations', params=params)
     
+    async def _count_resource(self, resource: str) -> int:
+        """Count all records of a resource by fetching only their IDs.
+
+        The webservice has no count endpoint, so we request `display=[id]`
+        (no limit) and count the returned list.
+        """
+        try:
+            response = await self._make_request('GET', resource, params={'display': '[id]'})
+            items = response.get(resource, []) if isinstance(response, dict) else []
+            return len(items) if isinstance(items, list) else 0
+        except Exception as e:
+            logging.warning(f"Could not count {resource}: {e}")
+            return 0
+
     async def get_shop_info(self) -> Dict[str, Any]:
         """Get general shop information and statistics."""
         try:
-            # Get basic shop info
             configs = await self.get_configurations()
-            
-            # Get product count
-            products = await self._make_request('GET', 'products', params={'limit': 1})
-            product_count = 0
-            if 'products' in products:
-                product_count = len(products.get('products', []))
-            
-            # Get category count
-            categories = await self._make_request('GET', 'categories', params={'limit': 1})
-            category_count = 0
-            if 'categories' in categories:
-                category_count = len(categories.get('categories', []))
-            
-            # Get customer count
-            customers = await self._make_request('GET', 'customers', params={'limit': 1})
-            customer_count = 0
-            if 'customers' in customers:
-                customer_count = len(customers.get('customers', []))
-            
-            # Get order count
-            orders = await self._make_request('GET', 'orders', params={'limit': 1})
-            order_count = 0
-            if 'orders' in orders:
-                order_count = len(orders.get('orders', []))
-            
+
             return {
                 "shop_info": {
-                    "product_count": product_count,
-                    "category_count": category_count,
-                    "customer_count": customer_count,
-                    "order_count": order_count
+                    "product_count": await self._count_resource('products'),
+                    "category_count": await self._count_resource('categories'),
+                    "customer_count": await self._count_resource('customers'),
+                    "order_count": await self._count_resource('orders')
                 },
                 "configurations": configs
             }
-        
+
         except Exception as e:
             return {"error": f"Could not retrieve shop info: {str(e)}"}
     
